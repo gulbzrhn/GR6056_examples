@@ -1,0 +1,400 @@
+---
+  title:  "Three Algorithms in your toolbox"
+  output: github_document
+
+---
+  
+```{r, include = FALSE}
+# loads necessary packages
+library(readr)          # easier reading of flat files
+library(ggplot2)        # pretty graphs made easy
+library(reshape2)       # nice correlation plots
+library(magrittr)       # ceci n'est pas une pipe
+library(tidyverse)      # the key to the Hadley world
+library(Zelig)          # everyone's package
+library(bestglm)
+
+# loads the data
+AllData <- read.csv("~/Dropbox/GR5069_Spring2018/GR5069_Spring2018/data_challenges/data/processed/AllViolenceData_171220.csv")
+```
+
+### Algorithm I: OLS (the inferential lane)
+
+We want to start understanding something about the dynamics in the `organized_crime_dead` variable, so we go down to the simplest characterization and seek some understanding on
+it "conditional mean" heavior. We run a simple model "controlling" for variables that 
+may have an influence on the **data generating process**.
+
+```{r}
+summary(
+  lm(organized_crime_dead ~ organized_crime_wounded +
+       afi + army + navy + federal_police +
+       long_guns_seized+ small_arms_seized + 
+       clips_seized + cartridge_sezied, 
+     data = AllData) 
+  )
+```
+
+Some interesting patterns arise:
+
+* conditional on everything else, an increase in one `organized_crime_dead` increases by 1/3 the number of `organized_crime_wounded`
+* conditional on everything else, confrontations where the army participates increase by 1/3 the number of `organized_crime_wounded`, and by ~2/3 in events where the navy participates
+* conditional on everything else, .15 more people die when long guns were seized
+
+Not quite possible to make any causal claims, for a number of reasons. But we also need to check some additional assumptions to make sure that even these estimates are not biased.
+
+For example, it is entirely possible that these variables are highly correlated and provide 
+very similar information, which migh create problems for estimation and inference.   
+A simple correlation plot among all variables in the model could be helpful to assess
+structure and facilitate model diagnosis and interpretation.
+
+To create a correlation plot, we need to:
+
+1. first define the subset of variables to those variables that we are focusing on
+
+```{r}
+col_vector <- c("organized_crime_dead", "organized_crime_wounded", "afi", "army",
+                "navy", "federal_police", "long_guns_seized", "small_arms_seized",
+                "clips_seized", "cartridge_sezied")
+```
+
+2. then create a dataframe that creates the combinations from the correlation matrix
+
+```{r}
+correlations <- AllData %>% 
+  select_(.dots = col_vector) %>%
+  cor(.) %>%
+  round(2) %>%
+  melt()
+```
+3. and then we graph
+
+```{r} 
+ggplot(correlations, aes(x=Var1, y=Var2, fill= value))+
+  geom_tile(color = "white") +
+  theme_minimal() +
+  scale_x_discrete("") +
+  scale_y_discrete("") +
+  theme(axis.text.x = element_text(angle =30, vjust =1, hjust =1)) +
+  scale_fill_gradient2(low = "blue", high = "red", mid = "white", 
+                       midpoint = 0, limit = c(-1,1), space = "Lab", 
+                       name="Pearson\nCorrelation") 
+```
+
+It looks like there's some variables that are highly correlated, but as we would expect: more cartridges are seized where more long guns are seized, but we don't really have linear combinations of variables. 
+
+Now, perhaps a quick look at the residuals from the regression
+
+```{r, include= FALSE }
+AllData$residuals <- residuals(
+    lm(organized_crime_dead ~ organized_crime_wounded +
+       afi + army + navy + federal_police +
+       long_guns_seized+ small_arms_seized + 
+       clips_seized + cartridge_sezied, 
+     data = AllData) 
+  )
+```
+
+```{r}
+ggplot(AllData, aes(global_id, residuals)) + 
+  geom_point(alpha = 1/2, size = 3) +
+  theme_minimal() +
+  scale_x_continuous("event id") +
+  scale_y_continuous("residuals") +
+  theme(axis.text.y = element_text(size=10),
+        axis.text.x = element_text(size=10),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank())
+```
+
+
+Something odd is going on with the estimation. It seems that there are some consistent 
+overpredictions. We forgot to look at the distribution of `organized_crime_dead` before
+we started. Let's do that now. 
+
+
+```{r}
+ggplot(data = AllData) +
+  geom_bar(aes(x=organized_crime_dead), fill = "blue") +
+  theme_minimal() +
+  scale_x_continuous("", breaks = c(0, 1,2,3,4,5,10,15,20,30),
+                     labels = c("0", "1","2","3","4", "5","10","15","20","30")) +
+  scale_y_continuous("") +  
+  theme(axis.text.y = element_text(size=14), 
+        axis.text.x = element_text(size=12),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank()
+  ) 
+```
+
+
+It turns out that `organized_crime_dead` is quite skeweded and has some zero-inflation. That may be causing some problems, including biasing our estimates. But we can always apply the textbook solution: `log(organized_crime_dead)`!
+
+
+```{r}
+ggplot(data = AllData) +
+  geom_bar(aes(x=log(organized_crime_dead+1)), fill = "blue") +
+  theme_minimal() +
+  scale_x_continuous("", breaks = c(0, 1,2,3,4,5,10,15,20,30),
+                     labels = c("0", "1","2","3","4", "5","10","15","20","30")) +
+  scale_y_continuous("") +  
+  theme(axis.text.y = element_text(size=14), 
+        axis.text.x = element_text(size=12),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank()
+) 
+```
+
+
+That didn't seem to correct the distribution of `organized_crime_dead`. Perhaps time to change to a more appropriate model?
+
+
+### Algorithm I: OLS (the predictive lane)
+
+But it's entirely possible that our interest is in predicting `organized_crime_dead`. So we switch gears since the inferential model is quite likely to generate terrible predictions. SO first, we need to select the most predictive covariates. 
+
+#### Best Subset Selection
+
+```{r}
+newdata <- AllData[, names(AllData) %in% c("organized_crime_wounded", "afi", "army",
+                "navy", "federal_police", "long_guns_seized", "small_arms_seized",
+                "clips_seized", "cartridge_sezied")]
+newdata <- cbind(newdata, organized_crime_dead = AllData$organized_crime_dead)
+subset_full <- bestglm(newdata, family = gaussian, IC = 'AIC', method = 'exhaustive', TopModels = 10) 
+subset_full$BestModels  #Top 10 models with low AIC
+```
+
+```{r}
+barplot(subset_full$BestModels[,'Criterion'], names.arg=sapply(1:10, toOrdinal), xlab = "model ranks", ylab = "AIC", ylim = c(5923, 5930), xpd = FALSE, main = "AIC of suggested models")
+```
+```{r}
+subset_full$BestModel
+```
+
+```{r}
+subset_full_bic <- bestglm(newdata, family = gaussian, IC = 'BIC', method = 'exhaustive', TopModels = 10) 
+subset_full_bic$BestModels  #Top 10 models with low BIC
+```
+
+```{r}
+barplot(subset_full_bic$BestModels[,'Criterion'], names.arg=sapply(1:10, toOrdinal), xlab = "model ranks", ylab = "BIC", ylim = c(5960, 5980), xpd = FALSE, main = "BIC of suggested models")
+```
+
+```{r}
+subset_full_bic$BestModel
+```
+
+To choose a best model among a set of models, we used AIC and BIC statistic. 7 variable model was suggested with AIC, and 5 variable model was suggested using BIC. Since BIC generally supports more parsimonious results, it was expectd to have less variables in the final model based on BIC.
+
+* 7 variable model based on AIC
+
+$organized~crime~dead = organized~crime~wounded + army + navy + federal~police + long~guns~seized + small~arms~seized + cartridge~sezied$
+
+* 5 variable model based on BIC
+
+$organized~crime~dead = organized~crime~wounded + army + navy + long~guns~seized + cartridge~sezied$
+
+#### Forward Selection
+
+```{r} 
+# forward selection
+forward_subset = regsubsets(organized_crime_dead ~ ., data = newdata, nvmax = 9, method = "forward")
+summary_fw <- summary(forward_subset)
+which.min(summary_fw$cp)
+```
+
+```{r}
+plot(summary_fw$cp, xlab = "Number of Variables", ylab = "Cp")
+```
+
+Best subset selection using AIC, and Forward stepwise selection using Mallows' Cp resulted in the same best model with 7 variables. 
+
+#### Model Selection with Validation Set
+
+```{r}
+set.seed(12910) #for replicability, always set a seed!
+n <- dim(newdata)[1]
+ntest <- round(n*0.3) #size of testing data
+index <- sample(n,ntest) # indices of testing samples
+data_test<- newdata[index,]
+data_train <- newdata[-index,]
+```
+
+```{r}
+fit = regsubsets(organized_crime_dead ~ ., data = data_train, nvmax = 9, method = "forward")
+```
+
+```{r}
+test_error = rep(NA, 9)
+test_model = model.matrix(organized_crime_dead ~ ., data = data_test)  
+for (i in 1:9) {
+    coeff = coef(fit, id = i)
+    pred = test_model[, names(coeff)] %*% coeff
+    test_error[i] = mean((data_test$organized_crime_dead - pred)^2)
+}
+plot(sqrt(test_error), ylab = "Root MSE", ylim=c(1.67, 1.91), pch = 19, type = "b")
+points(sqrt(fit$rss[-1]/3777), col = "blue", pch = 19, type = "b")
+legend("topright", legend = c("Training", "Validation"), col = c("blue", "black"), 
+    pch = 19)
+```
+
+As expected the training error descreases as model complexity increases, but we cannot observe the same pattern for test error. After 5 variable model validation error is somewhat steady, which is the same model as BIC is offered above. To obtain better results we should perform cross validation. 
+
+#### Model selection with Cross Validation
+
+```{r}
+set.seed(4837)
+forward_subset_cv = bestglm(newdata, family = gaussian, IC = 'CV', CVArgs=list(Method="HTF", K=10, REP=1),
+                         method = 'forward')   # 10-Fold Cross Validation
+summary(forward_subset_cv$BestModel)
+```
+
+```{r}
+error_CV <- forward_subset_cv$Subsets[,"CV"]
+sd_CV<- forward_subset_cv$Subsets[,"sdCV"]
+k <- 0:(length(error_CV)-1)
+
+dat <- as.data.frame(cbind(k, error_CV, sd_CV))
+ggplot(dat, aes(x=k, y=error_CV)) + 
+  geom_errorbar(aes(ymin=error_CV-sd_CV, ymax=error_CV+sd_CV), width=.1, col="blue") +
+  geom_line() +
+  geom_point()+
+  labs(title= "Model selection with 10-fold cross-validation and 1-sd rule", x="Subset Size", y= "CV_error")+
+  scale_x_discrete(limits=c(0:9))+
+  geom_vline(xintercept = oneSdRule(dat[,c("error_CV", "sd_CV")])-1, col="red", linetype="dotted", size=1)
+
+```
+
+### Algorithm II: logistic regression (the inferential lane) 
+
+We may need to deal with a different type of question. One very common case is that of binary variables that we need to analyze. From our data, we need to infer something about deaths among members of organized crime. So, we proceed to convert the continuous death variables into a binary indicator `organized_crime_death`.
+
+```{r}
+AllData$organized_crime_death <- ifelse(AllData$organized_crime_dead > 1, 1, 0)
+```
+
+We have a good handle now about some relationships between covariates in the data, so we can start by reproducing our previous model.
+
+```{r}
+summary(
+  glm(organized_crime_death ~ organized_crime_wounded +
+       afi + army + navy + federal_police +
+       long_guns_seized+ small_arms_seized + 
+       clips_seized + cartridge_sezied, 
+      family = binomial(link = "logit"), 
+     data = AllData) 
+)
+```
+
+
+Perhaps the most interesting thing for an is that is can easy translate estimates to probabilities. 
+
+
+One thing that is easy to forget is that logistic regression assumes that `organized_crime_death` is balanced, in the sense that each category represents about half its values, otherwise estimates may be biased. We never checked for that; let's do that now.
+
+
+```{r}
+ggplot(data = AllData) +
+  geom_bar(aes(x=organized_crime_death,
+               y = (..count..)/sum(..count..)), fill = "brown4") +
+  scale_y_continuous("", labels = scales::percent) +
+  scale_x_continuous("", breaks = c(0, 1),
+                     labels = c("no deaths", "deaths")) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size=14), 
+        axis.text.x = element_text(size=12),
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        panel.grid.minor.y = element_blank()
+  ) 
+``` 
+ 
+If the goal is inferential, there are ways to correct for this problem, primarily by weighting the likelihood function to minimize bias in the estimates. If that is not done, the model might be capturing well the oversampled category and ignoring the remaining category with the consequent implications.   
+ 
+ 
+ 
+### Algorithm II: logistic regression (the predictive lane)
+
+#### Best Subset Selection
+
+```{r, warning=FALSE}
+newdata1 <- AllData[, names(AllData) %in% c("organized_crime_wounded", "afi", "army",
+                "navy", "federal_police", "long_guns_seized", "small_arms_seized",
+                "clips_seized", "cartridge_sezied")]
+newdata1 <- cbind(newdata1, organized_crime_death = AllData$organized_crime_death)
+lg_subset <- bestglm(newdata1, family = binomial, IC = 'AIC', method = 'exhaustive', TopModels = 10) 
+lg_subset$BestModels  #Top 10 models with low AIC
+```
+
+```{r}
+barplot(lg_subset$BestModels[,'Criterion'], names.arg=sapply(1:10, toOrdinal), xlab = "model ranks", ylab = "AIC", ylim = c(4733, 4737), xpd = FALSE, main = "AIC of suggested models")
+```
+```{r}
+lg_subset$BestModel
+```
+
+```{r}
+lg_subset_bic <- bestglm(newdata1, family = binomial, IC = 'BIC', method = 'exhaustive', TopModels = 10) 
+lg_subset_bic$BestModels  #Top 10 models with low BIC
+```
+
+```{r, eval=FALSE}
+barplot(lg_subset_bic$BestModels[,'Criterion'], names.arg=sapply(1:10, toOrdinal), xlab = "model ranks", ylab = "BIC", ylim = c(4766, 4783), xpd = FALSE, main = "BIC of suggested models")
+```
+
+```{r}
+lg_subset_bic$BestModel
+```
+
+Both AIC and BIC suggested the same 5-variable model.
+
+* 5 variable model
+
+$organized~crime~dead = organized~crime~wounded + army + navy + long~guns~seized + cartridge~sezied$
+
+#### Forward and Backward selection
+
+```{r} 
+# forward selection
+lg_subset_fwd = bestglm(newdata1, family = binomial, IC = 'AIC', method = 'forward', TopModels = 10)
+summary(lg_subset_fwd$BestModel)
+```
+
+```{r}
+# backward selection
+lg_subset_bcw = bestglm(newdata1, family = binomial, IC = 'AIC', method = 'backward', TopModels = 10)
+summary(lg_subset_bcw $BestModel)
+```
+
+Forward and backward selection both agreed on 5 variable model that we obtained from best subset selection alghoritm. 
+
+#### Cross validation approach on Best subset selection
+
+```{r}
+set.seed(4837)
+lg_subset_cv= bestglm(newdata1, family = binomial, IC = 'CV', CVArgs=list(Method="HTF", K=10, REP=1),
+                         method = 'exhaustive') 
+
+summary(lg_subset_cv$BestModel)
+```
+
+```{r}
+cv_err <- lg_subset_cv$Subsets[,"CV"]
+sdCV<- lg_subset_cv$Subsets[,"sdCV"]
+k <- 0:(length(cv_err)-1)
+
+data <- as.data.frame(cbind(k, cv_err, sdCV))
+
+ggplot(data, aes(x=k, y=cv_err)) + 
+  geom_errorbar(aes(ymin=cv_err-sdCV, ymax=cv_err+sdCV), width=.1, col="blue") +
+  geom_line() +
+  geom_point()+
+  labs(title= "Model selection with 10-fold cross-validation and 1-sd rule", x="Subset Size", y= "CV_error")+
+  scale_x_discrete(limits=c(0:9))+
+  geom_vline(xintercept = oneSdRule(data[,c("cv_err", "sdCV")])-1, col="red", linetype="dotted", size=1)
+```
+
+10 fold cross validation approach suggested the model; 
+$organized~crime~dead = organized~crime~wounded + army + long~guns~seized$
